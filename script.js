@@ -131,8 +131,13 @@ class ImageEditor {
         this.fileInput.value = '';
     }
     
-    processImage() {
+    async processImage() {
         if (!this.originalImage) return;
+        
+        this.cutoutBtn.disabled = true;
+        this.cutoutBtn.textContent = '处理中...';
+        
+        await this.waitForFrame();
         
         const tolerance = parseInt(this.tolerance.value);
         const cutoutType = this.getCutoutType();
@@ -148,11 +153,7 @@ class ImageEditor {
         
         this.resultCtx.drawImage(this.originalImage, 0, 0);
         
-        if (cutoutType === 'portrait') {
-            this.autoRemoveBackground(tolerance, bgColor);
-        } else {
-            this.autoRemoveBackground(tolerance, bgColor);
-        }
+        await this.autoRemoveBackground(tolerance, bgColor);
         
         if (enhanceOptions.brightness) {
             this.adjustBrightness(20);
@@ -168,6 +169,9 @@ class ImageEditor {
         
         this.resultPlaceholder.style.display = 'none';
         this.resultContainer.style.display = 'block';
+        
+        this.cutoutBtn.disabled = false;
+        this.cutoutBtn.textContent = '开始抠图';
     }
     
     getCutoutType() {
@@ -201,7 +205,7 @@ class ImageEditor {
         }
     }
     
-    autoRemoveBackground(tolerance, bgColor) {
+    async autoRemoveBackground(tolerance, bgColor) {
         const imageData = this.resultCtx.getImageData(0, 0, this.resultCanvas.width, this.resultCanvas.height);
         const data = imageData.data;
         const width = this.resultCanvas.width;
@@ -210,10 +214,10 @@ class ImageEditor {
         const bgColorTolerance = (tolerance / 100) * 255;
         
         const corners = [
-            [10, 10],
-            [width - 10, 10],
-            [10, height - 10],
-            [width - 10, height - 10]
+            [Math.min(10, width - 1), Math.min(10, height - 1)],
+            [Math.max(0, width - 11), Math.min(10, height - 1)],
+            [Math.min(10, width - 1), Math.max(0, height - 11)],
+            [Math.max(0, width - 11), Math.max(0, height - 11)]
         ];
         
         const sampleColors = corners.map(([x, y]) => {
@@ -227,107 +231,130 @@ class ImageEditor {
             b: Math.round(sampleColors.reduce((sum, c) => sum + c.b, 0) / 4)
         };
         
-        const visited = new Set();
-        const queue = [];
+        const pixelCount = width * height;
+        const visited = new Uint8Array(pixelCount);
+        
+        const queueX = new Int32Array(Math.min(pixelCount, width * 4 + height * 4));
+        const queueY = new Int32Array(Math.min(pixelCount, width * 4 + height * 4));
+        let queueHead = 0;
+        let queueTail = 0;
+        
+        const enqueue = (x, y) => {
+            const idx = y * width + x;
+            if (visited[idx]) return;
+            
+            if (this.isSimilarColorFast(data, width, x, y, avgBgColor, bgColorTolerance)) {
+                visited[idx] = 1;
+                queueX[queueTail] = x;
+                queueY[queueTail] = y;
+                queueTail++;
+            }
+        };
         
         for (let x = 0; x < width; x++) {
-            if (this.isSimilarColor(data, width, x, 0, avgBgColor, bgColorTolerance)) {
-                queue.push([x, 0]);
-            }
-            if (this.isSimilarColor(data, width, x, height - 1, avgBgColor, bgColorTolerance)) {
-                queue.push([x, height - 1]);
-            }
+            enqueue(x, 0);
+            enqueue(x, height - 1);
         }
         
-        for (let y = 0; y < height; y++) {
-            if (this.isSimilarColor(data, width, 0, y, avgBgColor, bgColorTolerance)) {
-                queue.push([0, y]);
-            }
-            if (this.isSimilarColor(data, width, width - 1, y, avgBgColor, bgColorTolerance)) {
-                queue.push([width - 1, y]);
-            }
+        for (let y = 1; y < height - 1; y++) {
+            enqueue(0, y);
+            enqueue(width - 1, y);
         }
         
-        while (queue.length > 0) {
-            const [x, y] = queue.shift();
-            const key = `${x},${y}`;
+        await this.waitForFrame();
+        
+        let processedPixels = 0;
+        const batchSize = 50000;
+        
+        while (queueHead < queueTail) {
+            const x = queueX[queueHead];
+            const y = queueY[queueHead];
+            queueHead++;
             
-            if (visited.has(key)) continue;
-            if (x < 0 || x >= width || y < 0 || y >= height) continue;
+            const idx = (y * width + x) * 4;
             
-            if (this.isSimilarColor(data, width, x, y, avgBgColor, bgColorTolerance)) {
-                visited.add(key);
-                
-                const idx = (y * width + x) * 4;
-                if (bgColor) {
-                    const rgb = this.hexToRgb(bgColor);
-                    data[idx] = rgb.r;
-                    data[idx + 1] = rgb.g;
-                    data[idx + 2] = rgb.b;
-                    data[idx + 3] = 255;
-                } else {
-                    data[idx + 3] = 0;
-                }
-                
-                queue.push([x + 1, y]);
-                queue.push([x - 1, y]);
-                queue.push([x, y + 1]);
-                queue.push([x, y - 1]);
+            if (bgColor) {
+                const rgb = this.hexToRgb(bgColor);
+                data[idx] = rgb.r;
+                data[idx + 1] = rgb.g;
+                data[idx + 2] = rgb.b;
+                data[idx + 3] = 255;
+            } else {
+                data[idx + 3] = 0;
+            }
+            
+            if (x + 1 < width) enqueue(x + 1, y);
+            if (x - 1 >= 0) enqueue(x - 1, y);
+            if (y + 1 < height) enqueue(x, y + 1);
+            if (y - 1 >= 0) enqueue(x, y - 1);
+            
+            processedPixels++;
+            if (processedPixels >= batchSize) {
+                processedPixels = 0;
+                await this.waitForFrame();
             }
         }
         
         const edgeTolerance = bgColorTolerance * 0.8;
+        const bgRgb = bgColor ? this.hexToRgb(bgColor) : null;
+        
         for (let y = 0; y < height; y++) {
+            const rowStart = y * width;
+            
             for (let x = 0; x < width; x++) {
-                const idx = (y * width + x) * 4;
-                if (data[idx + 3] < 255) continue;
+                const idx = (rowStart + x) * 4;
+                if (data[idx + 3] === 0) continue;
                 
                 let nearBackground = false;
-                for (let dy = -2; dy <= 2 && !nearBackground; dy++) {
-                    for (let dx = -2; dx <= 2 && !nearBackground; dx++) {
+                const startDy = Math.max(-2, -y);
+                const endDy = Math.min(2, height - 1 - y);
+                
+                for (let dy = startDy; dy <= endDy && !nearBackground; dy++) {
+                    const startDx = Math.max(-2, -x);
+                    const endDx = Math.min(2, width - 1 - x);
+                    
+                    for (let dx = startDx; dx <= endDx && !nearBackground; dx++) {
                         if (dy === 0 && dx === 0) continue;
-                        const nx = x + dx;
-                        const ny = y + dy;
-                        if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
-                            const nidx = (ny * width + nx) * 4;
-                            if (data[nidx + 3] < 255) {
-                                nearBackground = true;
-                            }
+                        
+                        const nidx = ((y + dy) * width + (x + dx)) * 4;
+                        if (data[nidx + 3] < 255) {
+                            nearBackground = true;
                         }
                     }
                 }
                 
                 if (nearBackground) {
-                    if (this.isSimilarColor(data, width, x, y, avgBgColor, edgeTolerance)) {
-                        if (bgColor) {
-                            const rgb = this.hexToRgb(bgColor);
-                            data[idx] = rgb.r;
-                            data[idx + 1] = rgb.g;
-                            data[idx + 2] = rgb.b;
+                    if (this.isSimilarColorFast(data, width, x, y, avgBgColor, edgeTolerance)) {
+                        if (bgRgb) {
+                            data[idx] = bgRgb.r;
+                            data[idx + 1] = bgRgb.g;
+                            data[idx + 2] = bgRgb.b;
                         } else {
                             data[idx + 3] = 0;
                         }
                     }
                 }
             }
+            
+            if (y % 100 === 0) {
+                await this.waitForFrame();
+            }
         }
         
         this.resultCtx.putImageData(imageData, 0, 0);
     }
     
-    isSimilarColor(data, width, x, y, targetColor, tolerance) {
+    isSimilarColorFast(data, width, x, y, targetColor, tolerance) {
         const idx = (y * width + x) * 4;
         const r = data[idx];
         const g = data[idx + 1];
         const b = data[idx + 2];
         
-        const distance = Math.sqrt(
-            Math.pow(r - targetColor.r, 2) +
-            Math.pow(g - targetColor.g, 2) +
-            Math.pow(b - targetColor.b, 2)
-        );
+        const dr = r - targetColor.r;
+        const dg = g - targetColor.g;
+        const db = b - targetColor.b;
         
-        return distance <= tolerance;
+        return dr * dr + dg * dg + db * db <= tolerance * tolerance;
     }
     
     hexToRgb(hex) {
@@ -377,34 +404,43 @@ class ImageEditor {
         const height = this.resultCanvas.height;
         
         const outputData = new Uint8ClampedArray(data);
-        const weights = [0, -1, 0, -1, 5, -1, 0, -1, 0];
-        const weightSum = 1;
         
         for (let y = 1; y < height - 1; y++) {
             for (let x = 1; x < width - 1; x++) {
                 const idx = (y * width + x) * 4;
                 if (data[idx + 3] === 0) continue;
                 
-                let r = 0, g = 0, b = 0;
+                const idx00 = ((y - 1) * width + (x - 1)) * 4;
+                const idx01 = ((y - 1) * width + x) * 4;
+                const idx02 = ((y - 1) * width + (x + 1)) * 4;
+                const idx10 = (y * width + (x - 1)) * 4;
+                const idx12 = (y * width + (x + 1)) * 4;
+                const idx20 = ((y + 1) * width + (x - 1)) * 4;
+                const idx21 = ((y + 1) * width + x) * 4;
+                const idx22 = ((y + 1) * width + (x + 1)) * 4;
                 
-                for (let ky = -1; ky <= 1; ky++) {
-                    for (let kx = -1; kx <= 1; kx++) {
-                        const kidx = ((y + ky) * width + (x + kx)) * 4;
-                        const weight = weights[(ky + 1) * 3 + (kx + 1)];
-                        r += data[kidx] * weight;
-                        g += data[kidx + 1] * weight;
-                        b += data[kidx + 2] * weight;
-                    }
-                }
+                let r = -data[idx01] - data[idx10] + 5 * data[idx] - data[idx12] - data[idx21];
+                let g = -data[idx01 + 1] - data[idx10 + 1] + 5 * data[idx + 1] - data[idx12 + 1] - data[idx21 + 1];
+                let b = -data[idx01 + 2] - data[idx10 + 2] + 5 * data[idx + 2] - data[idx12 + 2] - data[idx21 + 2];
                 
-                outputData[idx] = Math.min(255, Math.max(0, r / weightSum));
-                outputData[idx + 1] = Math.min(255, Math.max(0, g / weightSum));
-                outputData[idx + 2] = Math.min(255, Math.max(0, b / weightSum));
+                outputData[idx] = Math.min(255, Math.max(0, r));
+                outputData[idx + 1] = Math.min(255, Math.max(0, g));
+                outputData[idx + 2] = Math.min(255, Math.max(0, b));
             }
         }
         
         const outputImageData = new ImageData(outputData, width, height);
         this.resultCtx.putImageData(outputImageData, 0, 0);
+    }
+    
+    waitForFrame() {
+        return new Promise(resolve => {
+            if (typeof requestAnimationFrame !== 'undefined') {
+                requestAnimationFrame(resolve);
+            } else {
+                setTimeout(resolve, 0);
+            }
+        });
     }
     
     applyPreset(preset) {
