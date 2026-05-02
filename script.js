@@ -212,42 +212,95 @@ class ImageEditor {
         const height = this.resultCanvas.height;
         
         const bgColorTolerance = (tolerance / 100) * 255;
+        const toleranceSquared = bgColorTolerance * bgColorTolerance;
         
-        const corners = [
-            [Math.min(10, width - 1), Math.min(10, height - 1)],
-            [Math.max(0, width - 11), Math.min(10, height - 1)],
-            [Math.min(10, width - 1), Math.max(0, height - 11)],
-            [Math.max(0, width - 11), Math.max(0, height - 11)]
-        ];
+        const samplePoints = [];
+        const sampleStep = Math.max(1, Math.floor(Math.min(width, height) / 20));
         
-        const sampleColors = corners.map(([x, y]) => {
+        for (let x = 0; x < width; x += sampleStep) {
+            samplePoints.push([x, 5]);
+            samplePoints.push([x, height - 5]);
+        }
+        
+        for (let y = sampleStep; y < height - sampleStep; y += sampleStep) {
+            samplePoints.push([5, y]);
+            samplePoints.push([width - 5, y]);
+        }
+        
+        const colorCounts = new Map();
+        let maxCount = 0;
+        let dominantBgColor = { r: 255, g: 255, b: 255 };
+        
+        for (const [x, y] of samplePoints) {
             const idx = (y * width + x) * 4;
-            return { r: data[idx], g: data[idx + 1], b: data[idx + 2] };
-        });
+            const r = data[idx];
+            const g = data[idx + 1];
+            const b = data[idx + 2];
+            
+            const rBucket = Math.round(r / 32) * 32;
+            const gBucket = Math.round(g / 32) * 32;
+            const bBucket = Math.round(b / 32) * 32;
+            
+            const key = `${rBucket},${gBucket},${bBucket}`;
+            const count = (colorCounts.get(key) || 0) + 1;
+            colorCounts.set(key, count);
+            
+            if (count > maxCount) {
+                maxCount = count;
+                dominantBgColor = { r: rBucket, g: gBucket, b: bBucket };
+            }
+        }
         
-        const avgBgColor = {
-            r: Math.round(sampleColors.reduce((sum, c) => sum + c.r, 0) / 4),
-            g: Math.round(sampleColors.reduce((sum, c) => sum + c.g, 0) / 4),
-            b: Math.round(sampleColors.reduce((sum, c) => sum + c.b, 0) / 4)
-        };
+        let rSum = 0, gSum = 0, bSum = 0, matchCount = 0;
+        for (const [x, y] of samplePoints) {
+            const idx = (y * width + x) * 4;
+            const r = data[idx];
+            const g = data[idx + 1];
+            const b = data[idx + 2];
+            
+            const dr = r - dominantBgColor.r;
+            const dg = g - dominantBgColor.g;
+            const db = b - dominantBgColor.b;
+            
+            if (dr * dr + dg * dg + db * db <= toleranceSquared) {
+                rSum += r;
+                gSum += g;
+                bSum += b;
+                matchCount++;
+            }
+        }
+        
+        const avgBgColor = matchCount > 0 ? {
+            r: Math.round(rSum / matchCount),
+            g: Math.round(gSum / matchCount),
+            b: Math.round(bSum / matchCount)
+        } : dominantBgColor;
         
         const pixelCount = width * height;
         const visited = new Uint8Array(pixelCount);
         
-        const queueX = new Int32Array(Math.min(pixelCount, width * 4 + height * 4));
-        const queueY = new Int32Array(Math.min(pixelCount, width * 4 + height * 4));
-        let queueHead = 0;
-        let queueTail = 0;
+        const queue = [];
+        
+        const isBgColor = (x, y) => {
+            const idx = (y * width + x) * 4;
+            const r = data[idx];
+            const g = data[idx + 1];
+            const b = data[idx + 2];
+            
+            const dr = r - avgBgColor.r;
+            const dg = g - avgBgColor.g;
+            const db = b - avgBgColor.b;
+            
+            return dr * dr + dg * dg + db * db <= toleranceSquared;
+        };
         
         const enqueue = (x, y) => {
             const idx = y * width + x;
             if (visited[idx]) return;
             
-            if (this.isSimilarColorFast(data, width, x, y, avgBgColor, bgColorTolerance)) {
+            if (isBgColor(x, y)) {
                 visited[idx] = 1;
-                queueX[queueTail] = x;
-                queueY[queueTail] = y;
-                queueTail++;
+                queue.push({ x, y });
             }
         };
         
@@ -261,15 +314,11 @@ class ImageEditor {
             enqueue(width - 1, y);
         }
         
-        await this.waitForFrame();
-        
         let processedPixels = 0;
         const batchSize = 50000;
         
-        while (queueHead < queueTail) {
-            const x = queueX[queueHead];
-            const y = queueY[queueHead];
-            queueHead++;
+        while (queue.length > 0) {
+            const { x, y } = queue.pop();
             
             const idx = (y * width + x) * 4;
             
@@ -296,35 +345,38 @@ class ImageEditor {
         }
         
         const edgeTolerance = bgColorTolerance * 0.8;
+        const edgeToleranceSquared = edgeTolerance * edgeTolerance;
         const bgRgb = bgColor ? this.hexToRgb(bgColor) : null;
         
         for (let y = 0; y < height; y++) {
-            const rowStart = y * width;
-            
             for (let x = 0; x < width; x++) {
-                const idx = (rowStart + x) * 4;
+                const idx = (y * width + x) * 4;
                 if (data[idx + 3] === 0) continue;
                 
                 let nearBackground = false;
-                const startDy = Math.max(-2, -y);
-                const endDy = Math.min(2, height - 1 - y);
-                
-                for (let dy = startDy; dy <= endDy && !nearBackground; dy++) {
-                    const startDx = Math.max(-2, -x);
-                    const endDx = Math.min(2, width - 1 - x);
-                    
-                    for (let dx = startDx; dx <= endDx && !nearBackground; dx++) {
+                for (let dy = -1; dy <= 1 && !nearBackground; dy++) {
+                    for (let dx = -1; dx <= 1 && !nearBackground; dx++) {
                         if (dy === 0 && dx === 0) continue;
-                        
-                        const nidx = ((y + dy) * width + (x + dx)) * 4;
-                        if (data[nidx + 3] < 255) {
-                            nearBackground = true;
+                        const nx = x + dx;
+                        const ny = y + dy;
+                        if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
+                            const nidx = (ny * width + nx) * 4;
+                            if (data[nidx + 3] === 0) {
+                                nearBackground = true;
+                            }
                         }
                     }
                 }
                 
                 if (nearBackground) {
-                    if (this.isSimilarColorFast(data, width, x, y, avgBgColor, edgeTolerance)) {
+                    const r = data[idx];
+                    const g = data[idx + 1];
+                    const b = data[idx + 2];
+                    const dr = r - avgBgColor.r;
+                    const dg = g - avgBgColor.g;
+                    const db = b - avgBgColor.b;
+                    
+                    if (dr * dr + dg * dg + db * db <= edgeToleranceSquared) {
                         if (bgRgb) {
                             data[idx] = bgRgb.r;
                             data[idx + 1] = bgRgb.g;
@@ -336,7 +388,7 @@ class ImageEditor {
                 }
             }
             
-            if (y % 100 === 0) {
+            if (y % 50 === 0) {
                 await this.waitForFrame();
             }
         }
